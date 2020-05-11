@@ -91,7 +91,7 @@ SuperBufFrames : MultiOutUGen {
 }
 
 
-SuperPlayBuf {
+SuperPlayBuf : MultiOutUGen{
     *ar { arg numChannels=1, bufnum=0, rate=1, trig=0, reset=0, start=0, end=nil, loop=1, quality=2;
         var pos;
         end = end ? SuperBufFrames.kr(bufnum);
@@ -100,12 +100,19 @@ SuperPlayBuf {
         ^SuperBufRd.ar(numChannels, bufnum, pos, 0, quality);
     }
 
-    *arDetails { arg numChannels=1, bufnum=0, rate=1, trig=0, reset=0, start=0, end=nil, loop=1, quality=2;
-        var pos, isPlaying;
-        end = end ? SuperBufFrames.kr(bufnum);
-        rate = BufRateScale.kr(bufnum) * rate;
-        # pos, isPlaying = SuperPhasor.arDetails(trig, rate, start, end, reset, loop);
-        ^[SuperBufRd.ar(numChannels, bufnum, pos, 0, quality), pos, isPlaying];
+    *arDetails{arg numChannels=1, bufnum=0, rate=1, trig=0, reset=0, start=0, end=nil, loop=1, quality=2;
+      ^this.multiNew(
+			   numChannels,bufnum,rate,trig,reset,start,end,loop,quality
+      )
+    }
+
+    // only called by arDetails
+    *new1 { arg numChannels=1, bufnum=0, rate=1, trig=0, reset=0, start=0, end=nil, loop=1, quality=2;
+          var pos, isPlaying;
+          end = end ? SuperBufFrames.kr(bufnum);
+          rate = BufRateScale.kr(bufnum) * rate;
+          # pos, isPlaying = SuperPhasor.arDetails(trig, rate, start, end, reset, loop);
+          ^[SuperBufRd.ar(numChannels, bufnum, pos, 0, quality), pos, isPlaying];
     }
 }
 
@@ -138,6 +145,140 @@ SuperPlayBufX {
         ^[XFade2.ar(XFade2.ar(sig0, sig1, pan0), XFade2.ar(sig2, sig3, pan1), pan2), phase0, playing];
     }
 }
+
+
+// copied from wslib, then adapted
+// fades (single) on loop points +
+// crossfades (dual) on trigger
+
+SuperPlayBufCF : MultiOutUGen{
+
+    classvar <fadeFuncs;
+    *initClass {
+        fadeFuncs = Dictionary[
+            \linear-> #{|x|x},
+            \equal -> #{|x|sin(x*pi/2)},
+            \sqrt  -> #{|x|sqrt(x)}
+        ]
+    }
+	// dual play buf which crosses from 1 to the other at trigger
+    *ar { arg numChannels=1, bufnum=0, rate=1, trig=0, reset=0, start=0, end=nil, loop=1, quality=2,fadeTime=0.1, fadeFunc=\sqrt, n= 2;
+		^this.multiNew(
+			numChannels,bufnum,rate,trig,
+			reset,start,end,loop,quality,fadeTime,fadeFunc,n
+		)
+	}
+
+	*arDetails{arg numChannels=1, bufnum=0, rate=1, trig=0, reset=0, start=0, end=nil, loop=1, quality=2,fadeTime=0.1, fadeFunc=\sqrt, n = 2;
+		^this.multiNew(
+			numChannels,bufnum,rate,trig,
+			reset,start,end,loop,quality,fadeTime,fadeFunc,n,true
+		)
+	}
+
+	*new1 { arg numChannels=1, bufnum=0, rate=1, trig=0, reset=0, start=0, end=nil, loop=1, quality=2,fadeTime=0.1, fadeFunc=\sqrt, n = 2, details=false;
+
+		var index, method = \ar, on, fadeTimeR;
+
+		switch ( trig.rate,
+			\audio, {
+                index = Stepper.ar( trig, 0, 0, n-1 );
+			},
+			\control, {
+				index = Stepper.kr( trig, 0, 0, n-1 );
+				method = \kr;
+			},
+			\demand, {
+				trig = TDuty.ar( trig ); // audio rate precision for demand ugens
+				index = Stepper.ar( trig, 0, 0, n-1 );
+			},
+			{ ^this.prMakeFadingPlayBuf( numChannels, bufnum, rate, trig, reset,start, end, loop, quality, fadeTime, details ) } // bypass
+		);
+
+        if(fadeFunc.isSymbol){
+            fadeFunc = this.fadeFuncs[fadeFunc];
+        };
+        if(fadeFunc.isFunction.not){
+            fadeFunc = this.fadeFuncs[\sqrt];
+        };
+
+		on = n.collect({ |i|
+			//on = (index >= i) * (index <= i); // more optimized way?
+			InRange.perform( method, index, i-0.5, i+0.5 );
+		});
+
+		switch ( rate.rate,
+			\demand,  {
+				rate = on.collect({ |on, i|
+					Demand.perform( method, on, 0, rate );
+				});
+			},
+			\control, {
+				rate = on.collect({ |on, i|
+					Gate.kr( rate, on ); // hold rate at crossfade
+				});
+			},
+			\audio, {
+				rate = on.collect({ |on, i|
+					Gate.ar( rate, on );
+				});
+			},
+			{
+				rate = rate.asCollection;
+			}
+		);
+
+		if( start.rate == \demand ) {
+			start = Demand.perform( method, trig, 0, start )
+		};
+
+		fadeTimeR = fadeTime.reciprocal;
+		if(details){
+			var players, pos;
+			#players, pos =
+				this.prMakeFadingPlayBuf(
+					numChannels, bufnum, rate, on,
+					reset,start, end, loop, quality, fadeTime, true
+				);
+			players = Mix(
+                players * fadeFunc.value(Slew.perform( method, index, fadeTimeR, fadeTimeR ))
+            );
+			pos = Select.kr(on[1],pos);
+			^[players,pos];
+		}{
+
+			^Mix(
+				this.prMakeFadingPlayBuf( numChannels, bufnum, rate, on, reset,start, end, loop, quality, fadeTime )
+                * fadeFunc.value(
+                    Slew.perform(method, on, fadeTimeR, fadeTimeR)
+                )
+			);
+		}
+
+	}
+
+
+	*prMakeFadingPlayBuf{arg numChannels=1, bufnum=0, rate=1, trig=0, reset=0, start=0, end=nil, loop=1, quality=2, fadeTime=0.1, details=false;
+        var pos,pos_f,fade_f,loop_fade,start_f,end_f,player;
+        start_f = start.asFloat;
+        end = end ? SuperBufFrames.kr(bufnum);
+		end_f = end.asFloat;
+        rate = BufRateScale.kr(bufnum) * rate;
+        pos = SuperPhasor.ar(trig, rate, start, end, reset, loop);
+		pos_f = pos.asFloat;
+		fade_f = fadeTime * BufSampleRate.ir(bufnum) / rate;
+		loop_fade = pos_f.linlin(start_f,start_f+fade_f,0,1)*pos_f.linlin(end_f-fade_f,end_f,1,0);
+		player = SuperBufRd.ar(numChannels, bufnum, pos, 0, quality)*loop_fade;
+		if(details){
+			^[player,pos_f]
+		}{
+			^player
+		};
+
+	}
+
+}
+
 
 + Buffer {
     atSec { arg secs;
